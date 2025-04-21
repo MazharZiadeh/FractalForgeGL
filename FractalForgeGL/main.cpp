@@ -1,13 +1,47 @@
-﻿#include "MandelbrotRenderer.h"
+﻿// ─────────────────────────────────────────────────────────────────────────────
+//  Mandelbrot + NSGA‑II  — all‑tweakables‑up‑front version
+//  Build (Linux/macOS):
+//      g++ -std=c++17 -O2 main.cpp MandelbrotRenderer.cpp NSGAII.cpp glad.c \
+//          -lglfw -ldl -lGL -pthread -o MandelbrotNSGA
+//  Build (MSVC):
+//      cl /std:c++17 /O2 main.cpp MandelbrotRenderer.cpp NSGAII.cpp glad.c\
+//          glfw3.lib opengl32.lib user32.lib gdi32.lib shell32.lib
+// ─────────────────────────────────────────────────────────────────────────────
+#include "MandelbrotRenderer.h"
 #include "NSGAII.h"
 #include "Logger.h"
 #include <iostream>
+#include <cmath>
 
-constexpr int   SCR_W = 1280, SCR_H = 720;
-constexpr float TARGET_FPS = 60.0f;
+// ─────────── 1. ALL PARAMETERS IN ONE PLACE ─────────────────────────────────
+namespace CFG {
+    // Window / view
+    constexpr int   winW = 1280;
+    constexpr int   winH = 720;
+    constexpr float panSpeed = 0.004f;     // relative to zoom
+    constexpr float zoomFactor = 1.07f;
+
+    // Evolution
+    constexpr int   popSize = 48;
+    constexpr int   minIterLOD = 128;
+    constexpr int   maxIterLOD = 20000;
+    constexpr float mutateProb = 0.9f;       // (inside NSGAII::evolve)
+    constexpr int   mutateDelta = 256;
+
+    // Performance target
+    constexpr float targetFPS = 60.0f;
+
+    // Off‑screen fitness buffer (increase to raise GPU cost & metric fidelity)
+    constexpr int   evalW = 1024;
+    constexpr int   evalH = 1024;
+
+    // CSV output
+    constexpr const char* csvFile = "run_log.csv";
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 int main() {
-    // ─── init GLFW + GLAD ────────────────────────────────────────────────────
+    // ─── GLFW / GLAD init ───────────────────────────────────────────────────
     if (!glfwInit()) { std::cerr << "GLFW failed\n"; return -1; }
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
@@ -15,7 +49,8 @@ int main() {
 #ifdef __APPLE__
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
-    GLFWwindow* win = glfwCreateWindow(SCR_W, SCR_H, "Mandelbrot‑NSGA CSV", nullptr, nullptr);
+    GLFWwindow* win = glfwCreateWindow(CFG::winW, CFG::winH,
+        "Mandelbrot‑NSGA (CFG edition)", nullptr, nullptr);
     if (!win) { std::cerr << "Window failed\n"; return -1; }
     glfwMakeContextCurrent(win);
     glfwSwapInterval(1);
@@ -23,93 +58,84 @@ int main() {
         std::cerr << "GLAD failed\n"; return -1;
     }
 
-    // ─── components ──────────────────────────────────────────────────────────
-    MandelbrotRenderer renderer(SCR_W, SCR_H);
-    NSGAII             evo(32, 64, 4096);
-    CSVLogger          log("run_log.csv");
+    // ─── components ─────────────────────────────────────────────────────────
+    MandelbrotRenderer renderer(CFG::winW, CFG::winH);          // off‑screen size set inside
+    NSGAII             evo(CFG::popSize, CFG::minIterLOD, CFG::maxIterLOD);
+    CSVLogger          log(CFG::csvFile);
 
-    // ‑‑ basic camera state
+    // Camera state
     float cx = -0.5f, cy = 0.0f, zoom = 1.0f;
-    float viewPack[3] = { cx,cy,zoom };
-    glfwSetWindowUserPointer(win, viewPack);
-    glfwSetKeyCallback(win, [](GLFWwindow* w, int k, int, int a, int) {
-        if (a != GLFW_PRESS && a != GLFW_REPEAT) return;
-        float* p = (float*)glfwGetWindowUserPointer(w);
-        float& cx = *p, & cy = *(p + 1), & zoom = *(p + 2);
-        float pan = 0.005f * zoom;
-        switch (k) {
-        case GLFW_KEY_UP:   cy += pan; break;
+    float view[3] = { cx, cy, zoom };
+    glfwSetWindowUserPointer(win, view);
+    glfwSetKeyCallback(win, [](GLFWwindow* w, int key, int, int act, int) {
+        if (act != GLFW_PRESS && act != GLFW_REPEAT) return;
+        auto* v = static_cast<float*>(glfwGetWindowUserPointer(w));
+        float& cx = v[0], & cy = v[1], & z = v[2];
+        float pan = CFG::panSpeed * z;
+        switch (key) {
+        case GLFW_KEY_UP: cy += pan; break;
         case GLFW_KEY_DOWN: cy -= pan; break;
         case GLFW_KEY_LEFT: cx -= pan; break;
-        case GLFW_KEY_RIGHT:cx += pan; break;
-        case GLFW_KEY_Z:    zoom /= 1.1f; break;
-        case GLFW_KEY_X:    zoom *= 1.1f; break;
+        case GLFW_KEY_RIGHT: cx += pan; break;
+        case GLFW_KEY_Z: z /= CFG::zoomFactor; break;
+        case GLFW_KEY_X: z *= CFG::zoomFactor; break;
         }
         });
 
-    // ─── evolutionary loop ───────────────────────────────────────────────────
-    int generation = 0, idxInGen = 0;
+    // ─── evolutionary loop ─────────────────────────────────────────────────
+    int gen = 0, idx = 0;
     while (!glfwWindowShouldClose(win)) {
-        // update view from keys
-        cx = viewPack[0]; cy = viewPack[1]; zoom = viewPack[2];
+        // fetch updated view
+        cx = view[0]; cy = view[1]; zoom = view[2];
 
         // set genome + view
         renderer.setView(cx, cy, zoom);
         renderer.setMaxIter(evo.current().maxIter);
-
-        // render off‑screen for fitness
         renderer.renderOffscreen();
 
-        // collect metrics
-        float fpsErr = std::abs(renderer.fps() - TARGET_FPS);
+        // ----- fitness metrics -----
+        float fpsErr = std::abs(renderer.fps() - CFG::targetFPS);
         float gpuMs = renderer.lastGpuTimeMs();
 
-        // boundary complexity & variance on small FBO
-        const unsigned char* pix = renderer.pixelPtr();
+        const unsigned char* px = renderer.pixelPtr();
         int edges = 0; double sum = 0, sum2 = 0;
-        for (int y = 1;y < MandelbrotRenderer::OFF_H;++y)
-            for (int x = 1;x < MandelbrotRenderer::OFF_W;++x) {
+        for (int y = 1; y < MandelbrotRenderer::OFF_H; ++y)
+            for (int x = 1; x < MandelbrotRenderer::OFF_W; ++x) {
                 int i = y * MandelbrotRenderer::OFF_W + x;
-                if (pix[i] != pix[i - 1] || pix[i] != pix[i - MandelbrotRenderer::OFF_W]) ++edges;
+                if (px[i] != px[i - 1] || px[i] != px[i - MandelbrotRenderer::OFF_W]) ++edges;
             }
-        for (int i = 0;i < MandelbrotRenderer::OFF_W * MandelbrotRenderer::OFF_H;++i) {
-            float v = pix[i] / 255.0f; sum += v; sum2 += v * v;
+        for (int i = 0; i < MandelbrotRenderer::OFF_W * MandelbrotRenderer::OFF_H; ++i) {
+            float v = px[i] / 255.f; sum += v; sum2 += v * v;
         }
         int N = MandelbrotRenderer::OFF_W * MandelbrotRenderer::OFF_H;
         float var = (sum2 / N) - float(sum / N) * float(sum / N);
 
-        // push fitness & log eval
-        evo.setFitness(fpsErr, gpuMs, (float)edges, var);
-        log.row("EVAL", generation, idxInGen, evo.current().maxIter,
+        evo.setFitness(fpsErr, gpuMs, float(edges), var);
+        log.row("EVAL", gen, idx, evo.current().maxIter,
             fpsErr, gpuMs, edges, var, -1);
 
-        // onscreen draw best so far
+        // draw best individual onscreen
         renderer.setMaxIter(evo.best().maxIter);
         renderer.renderOnscreen();
 
-        // GUI & swap
         glfwSwapBuffers(win);
         glfwPollEvents();
 
-        // advance individual / generation
+        // move to next individual / generation
         if (evo.nextIndividual()) {
-            // generation finished → log Pareto front
             evo.recalcRanks();
-            const auto& pop = evo.population();
-            for (size_t i = 0;i < pop.size();++i)
-                if (pop[i].rank == 0)
-                    log.row("FRONT", generation, (int)i, pop[i].maxIter,
-                        pop[i].obj[0], pop[i].obj[1],
-                        -pop[i].obj[2], -pop[i].obj[3],
-                        pop[i].rank);
-
+            for (size_t i = 0; i < evo.population().size(); ++i)
+                if (evo.population()[i].rank == 0)
+                    log.row("FRONT", gen, static_cast<int>(i), evo.population()[i].maxIter,
+                        evo.population()[i].obj[0], evo.population()[i].obj[1],
+                        -evo.population()[i].obj[2], -evo.population()[i].obj[3],
+                        evo.population()[i].rank);
             evo.evolve();
-            ++generation;
-            idxInGen = 0;
+            ++gen; idx = 0;
         }
-        else ++idxInGen;
+        else ++idx;
     }
     glfwTerminate();
-    std::cout << "Run complete.  CSV written to run_log.csv\n";
+    std::cout << "Run complete. CSV written to " << CFG::csvFile << "\n";
     return 0;
 }
